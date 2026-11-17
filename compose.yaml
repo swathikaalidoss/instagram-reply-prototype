@@ -1,0 +1,25 @@
+services:
+  instagram-replies:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8081:8081"
+    env_file: .env
+    volumes:
+      - reply-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+  webhook-tunnel:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate --url http://instagram-replies:8081
+    profiles: ["webhook"]
+    depends_on:
+      instagram-replies:
+        condition: service_healthy
+    restart: unless-stopped
+volumes:
+  reply-data:
