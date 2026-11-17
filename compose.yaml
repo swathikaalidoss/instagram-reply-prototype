@@ -21,5 +21,13 @@ services:
       instagram-replies:
         condition: service_healthy
     restart: unless-stopped
+  website-tunnel:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate --url http://instagram-replies:8080
+    profiles: ["website"]
+    depends_on:
+      instagram-replies:
+        condition: service_healthy
+    restart: unless-stopped
 volumes:
   reply-data:

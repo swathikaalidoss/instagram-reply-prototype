@@ -1,4 +1,5 @@
 """Dependency-free local Instagram comment auto-reply prototype."""
+import contextvars
 import hashlib
 import hmac
 import json
@@ -20,6 +21,7 @@ MODE = os.getenv('MODE', 'demo')
 DATA = Path(os.getenv('DATA_DIR', 'data'))
 DB = DATA / 'replies.db'
 JOBS = queue.Queue()
+ACCOUNT = contextvars.ContextVar('account', default=1)
 DEFAULTS = {
     'enabled': True,
     'scope': 'all',
@@ -42,6 +44,7 @@ def connect():
 
 
 def init():
+    ACCOUNT.set(1)
     DATA.mkdir(parents=True, exist_ok=True)
     auth.init(connect)
     with connect() as db:
@@ -69,6 +72,12 @@ def init():
             config.setdefault(key, DEFAULTS[key])
         db.execute('UPDATE settings SET value=? WHERE id=1', (json.dumps(config),))
         db.execute('CREATE TABLE IF NOT EXISTS library (id INTEGER PRIMARY KEY, value TEXT, updated REAL)')
+        db.execute("CREATE TABLE IF NOT EXISTS accounts (id INTEGER PRIMARY KEY, instagram_id TEXT UNIQUE NOT NULL, username TEXT NOT NULL, token TEXT NOT NULL)")
+        db.execute("INSERT OR IGNORE INTO accounts VALUES (1,?,?,?)", (os.getenv('INSTAGRAM_ACCOUNT_ID', ''), 'Primary account', ''))
+        columns = {r['name'] for r in db.execute('PRAGMA table_info(comments)')}
+        if 'account_key' not in columns:
+            db.execute('ALTER TABLE comments ADD COLUMN account_key INTEGER NOT NULL DEFAULT 1')
+        db.execute('CREATE INDEX IF NOT EXISTS comments_account ON comments(account_key,created)')
         # A crash after submitting a request leaves its outcome unknown. Never retry blindly.
         db.execute("UPDATE comments SET dm_status='uncertain' WHERE dm_status='sending'")
         db.execute("UPDATE comments SET public_status='uncertain' WHERE public_status='sending'")
@@ -79,7 +88,7 @@ def init():
 
 def settings():
     with connect() as db:
-        return json.loads(db.execute('SELECT value FROM settings WHERE id=1').fetchone()[0])
+        return json.loads(db.execute('SELECT value FROM settings WHERE id=?', (ACCOUNT.get(),)).fetchone()[0])
 
 
 def draft(text, config):
@@ -96,9 +105,9 @@ def ingest(comment_id, username, text, source, media_id=''):
     allowed = config['enabled'] and in_scope and reply is not None
     reason = '' if allowed else ('Automation is paused.' if not config['enabled'] else 'Post is outside the selected scope.' if not in_scope else 'No keyword matched; fallback replies are off.')
     with connect() as db:
-        result = db.execute('INSERT OR IGNORE INTO comments (id,username,text,reply,source,status,created,public_reply,media_id,detail) VALUES (?,?,?,?,?,?,?,?,?,?)',
+        result = db.execute('INSERT OR IGNORE INTO comments (id,username,text,reply,source,status,created,public_reply,media_id,detail,account_key) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
                             (comment_id, username, text, reply or '', source,
-                             'queued' if allowed else 'skipped', time.time(), config['public_reply'], media_id, reason))
+                             'queued' if allowed else 'skipped', time.time(), config['public_reply'], media_id, reason, ACCOUNT.get()))
     if result.rowcount:
         if allowed:
             JOBS.put(comment_id)
@@ -106,19 +115,68 @@ def ingest(comment_id, username, text, source, media_id=''):
     return False
 
 
+def credentials():
+    with connect() as db:
+        row = db.execute('SELECT * FROM accounts WHERE id=?', (ACCOUNT.get(),)).fetchone()
+    if not row:
+        raise ValueError('Unknown account')
+    result = dict(row)
+    if result['id'] == 1:
+        result['instagram_id'] = os.getenv('INSTAGRAM_ACCOUNT_ID', result['instagram_id'])
+        result['token'] = os.getenv('INSTAGRAM_ACCESS_TOKEN', '')
+    return result
+
+
+def accounts():
+    with connect() as db:
+        return [dict(r) for r in db.execute('SELECT id,instagram_id,username FROM accounts ORDER BY id')]
+
+
+def add_account(body):
+    account_id, token = body.get('instagram_id', ''), body.get('token', '')
+    if not isinstance(account_id, str) or not account_id.isdigit() or not isinstance(token, str) or not 10 <= len(token) <= 8192:
+        raise ValueError('Enter a valid account ID and access token')
+    with connect() as db:
+        if db.execute('SELECT 1 FROM accounts WHERE instagram_id=?', (account_id,)).fetchone():
+            raise ValueError('Account already connected')
+    host = os.getenv('GRAPH_API_HOST', 'graph.facebook.com')
+    if host not in ('graph.facebook.com', 'graph.instagram.com'):
+        raise ValueError('Unsupported host')
+    base = f'https://{host}/{os.getenv("GRAPH_API_VERSION", "v27.0")}/'
+    headers = {'Authorization': 'Bearer ' + token}
+    # Validate access and comment subscription before storing credentials.
+    try:
+        with urlopen(Request(base + account_id + '?fields=id,username', headers=headers), timeout=20) as response:
+            profile = json.load(response)
+        if str(profile.get('id')) != account_id or not profile.get('username'):
+            raise ValueError('Account identity mismatch')
+        with urlopen(Request(base + account_id + '/subscribed_apps', data=urlencode({'subscribed_fields': 'comments'}).encode(), headers=headers), timeout=20) as response:
+            if not json.load(response).get('success'):
+                raise ValueError('Subscription failed')
+    except Exception:
+        raise ValueError('Connection failed. Check the account ID, token, app access, and comments permissions.') from None
+    with connect() as db:
+        try:
+            key = db.execute('INSERT INTO accounts (instagram_id,username,token) VALUES (?,?,?)', (account_id, profile['username'], token)).lastrowid
+        except sqlite3.IntegrityError:
+            raise ValueError('Account already connected') from None
+        db.execute('INSERT INTO settings VALUES (?,?)', (key, json.dumps({**DEFAULTS, 'enabled': False})))
+    return key
+
+
 def graph_get(path, params):
     host = os.getenv('GRAPH_API_HOST', 'graph.facebook.com')
     if host not in ('graph.facebook.com', 'graph.instagram.com'):
         raise ValueError('Unsupported Meta API host')
     request = Request(f'https://{host}/{os.getenv("GRAPH_API_VERSION", "v27.0")}/{path}?{urlencode(params)}',
-                      headers={'Authorization': 'Bearer ' + os.environ['INSTAGRAM_ACCESS_TOKEN']})
+                      headers={'Authorization': 'Bearer ' + credentials()['token']})
     with urlopen(request, timeout=20) as response:
         return json.load(response)
 
 
 def library():
     with connect() as db:
-        row = db.execute('SELECT value,updated FROM library WHERE id=1').fetchone()
+        row = db.execute('SELECT value,updated FROM library WHERE id=?', (ACCOUNT.get(),)).fetchone()
     if row:
         return {**json.loads(row['value']), 'updated': row['updated']}
     return {'account': None, 'posts': [], 'updated': None}
@@ -131,12 +189,13 @@ def sync_library():
             {'id': 'demo-post-2', 'caption': 'Made slowly, loved for a long time. A look behind the scenes.', 'media_type': 'VIDEO', 'timestamp': '2026-11-12T10:00:00+00:00'},
             {'id': 'demo-post-3', 'caption': 'Something special is coming. Say hello in the comments.', 'media_type': 'CAROUSEL_ALBUM', 'timestamp': '2026-11-09T10:00:00+00:00'},
         ]}
-    account_id = os.environ['INSTAGRAM_ACCOUNT_ID']
+    account_id = credentials()['instagram_id']
     account = graph_get(account_id, {'fields': 'id,username'})
     posts = graph_get(account_id + '/media', {'fields': 'id,caption,media_type,media_url,thumbnail_url,permalink,timestamp', 'limit': 50})
     result = {'account': account, 'posts': posts.get('data', [])}
     with connect() as db:
-        db.execute('INSERT OR REPLACE INTO library VALUES (1,?,?)', (json.dumps(result), time.time()))
+        db.execute('INSERT OR REPLACE INTO library VALUES (?,?,?)', (ACCOUNT.get(), json.dumps(result), time.time()))
+        db.execute('UPDATE accounts SET username=? WHERE id=?', (account['username'], ACCOUNT.get()))
     return library()
 
 
@@ -146,7 +205,7 @@ def graph_post(path, payload):
     if host not in ('graph.facebook.com', 'graph.instagram.com'):
         raise ValueError('Unsupported Meta API host')
     request = Request(f'https://{host}/{version}/{path}', data=json.dumps(payload).encode(),
-                      headers={'Authorization': 'Bearer ' + os.environ['INSTAGRAM_ACCESS_TOKEN'], 'Content-Type': 'application/json'})
+                      headers={'Authorization': 'Bearer ' + credentials()['token'], 'Content-Type': 'application/json'})
     with urlopen(request, timeout=20) as response:
         return json.load(response)
 
@@ -163,6 +222,7 @@ def process(comment_id):
         row = db.execute('SELECT * FROM comments WHERE id=?', (comment_id,)).fetchone()
         if not row or row['status'] != 'queued':
             return
+        ACCOUNT.set(row['account_key'])
         current = settings()
         if not current['enabled'] or (current['scope'] == 'selected' and row['media_id'] not in current['selected_media_ids']):
             db.execute("UPDATE comments SET status='skipped', detail='Automation was paused before sending.' WHERE id=?", (comment_id,))
@@ -178,7 +238,7 @@ def process(comment_id):
         else:
             try:
                 update_action(comment_id, 'dm', 'sending')
-                result = graph_post(os.environ['INSTAGRAM_ACCOUNT_ID'] + '/messages',
+                result = graph_post(credentials()['instagram_id'] + '/messages',
                                     {'recipient': {'comment_id': comment_id}, 'message': {'text': row['reply']}})
                 if not result.get('message_id'):
                     raise ValueError('DM response did not include a message ID')
@@ -233,7 +293,22 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def select_account(self):
+        value = self.headers.get('X-Account-ID', '1')
+        if not value.isdigit():
+            self.send({'error': 'Unknown account'}, 404)
+            return False
+        key = int(value)
+        with connect() as db:
+            exists = db.execute('SELECT 1 FROM accounts WHERE id=?', (key,)).fetchone()
+        if not exists:
+            self.send({'error': 'Unknown account'}, 404)
+            return False
+        ACCOUNT.set(key)
+        return True
+
     def do_GET(self):
+        ACCOUNT.set(1)
         parsed = urlparse(self.path)
         if getattr(self.server, 'webhook_only', False) and parsed.path != '/webhook':
             return self.send({'error': 'Not found'}, 404)
@@ -249,13 +324,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.send({'initialized': auth.initialized(connect), 'authenticated': auth.authenticated(connect, self.headers.get('Cookie'))})
         if parsed.path.startswith('/api/') and not auth.authenticated(connect, self.headers.get('Cookie')):
             return self.send({'error': 'Please sign in.'}, 401)
+        if parsed.path == '/api/accounts':
+            return self.send({'accounts': accounts()})
+        if parsed.path.startswith('/api/') and not self.select_account():
+            return
         if parsed.path == '/api/library':
             return self.send(sync_library() if MODE == 'demo' else library())
         if parsed.path == '/api/state':
             with connect() as db:
-                rows = [dict(row) for row in db.execute('SELECT * FROM comments ORDER BY created DESC LIMIT 100')]
-                totals = {row['status']: row['n'] for row in db.execute('SELECT status,COUNT(*) AS n FROM comments WHERE source="instagram" GROUP BY status')}
-            return self.send({'mode': MODE, 'settings': settings(), 'comments': rows, 'totals': totals, 'account_id': os.getenv('INSTAGRAM_ACCOUNT_ID', ''), 'webhook_ready': bool(os.getenv('META_APP_SECRET') and os.getenv('WEBHOOK_VERIFY_TOKEN'))})
+                rows = [dict(row) for row in db.execute('SELECT * FROM comments WHERE account_key=? ORDER BY created DESC LIMIT 100', (ACCOUNT.get(),))]
+                totals = {row['status']: row['n'] for row in db.execute('SELECT status,COUNT(*) AS n FROM comments WHERE source="instagram" AND account_key=? GROUP BY status', (ACCOUNT.get(),))}
+            return self.send({'mode': MODE, 'settings': settings(), 'comments': rows, 'totals': totals, 'account_id': credentials()['instagram_id'], 'account_key': ACCOUNT.get(), 'webhook_ready': bool(os.getenv('META_APP_SECRET') and os.getenv('WEBHOOK_VERIFY_TOKEN'))})
         base = Path(__file__).parent / 'static'
         asset = (base / ('index.html' if parsed.path == '/' else parsed.path.lstrip('/'))).resolve()
         if base.resolve() in asset.parents and asset.is_file():
@@ -263,6 +342,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send({'error': 'Not found'}, 404)
 
     def do_POST(self):
+        ACCOUNT.set(1)
         if getattr(self.server, 'webhook_only', False) and self.path != '/webhook':
             return self.send({'error': 'Not found'}, 404)
         try:
@@ -277,12 +357,15 @@ class Handler(BaseHTTPRequestHandler):
                 if payload.get('object') != 'instagram':
                     return self.send({'ok': True})
                 for entry in payload.get('entry', []):
-                    if str(entry.get('id')) != os.getenv('INSTAGRAM_ACCOUNT_ID'):
+                    with connect() as db:
+                        target = db.execute('SELECT id FROM accounts WHERE instagram_id=?', (str(entry.get('id')),)).fetchone()
+                    if not target:
                         continue
+                    ACCOUNT.set(target['id'])
                     for change in entry.get('changes', []):
                         value = change.get('value', {})
                         author = value.get('from', {})
-                        if change.get('field') != 'comments' or value.get('parent_id') or str(author.get('id')) == os.getenv('INSTAGRAM_ACCOUNT_ID'):
+                        if change.get('field') != 'comments' or value.get('parent_id') or str(author.get('id')) == credentials()['instagram_id']:
                             continue
                         cid, comment = str(value.get('id', '')), value.get('text', '')
                         if cid.isdigit() and comment:
@@ -305,6 +388,13 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == '/api/auth/logout':
                 auth.logout(connect, self.headers.get('Cookie'))
                 return self.send({'ok': True}, cookie=auth.session_cookie(''))
+            if self.path == '/api/accounts':
+                try:
+                    return self.send({'id': add_account(body), 'accounts': accounts()}, 201)
+                except ValueError as error:
+                    return self.send({'error': str(error)}, 400)
+            if not self.select_account():
+                return
             if self.path == '/api/sync':
                 try:
                     return self.send(sync_library())
@@ -336,7 +426,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send({'error': 'Select at least one post before enabling automation.'}, 400)
                 clean = {key: body[key] for key in ('enabled', 'rules', 'fallback', 'public_reply', 'scope', 'selected_media_ids', 'reply_unmatched')}
                 with connect() as db:
-                    db.execute('UPDATE settings SET value=? WHERE id=1', (json.dumps(clean),))
+                    db.execute('UPDATE settings SET value=? WHERE id=?', (json.dumps(clean), ACCOUNT.get()))
                 return self.send({'ok': True})
             self.send({'error': 'Not found'}, 404)
         except (ValueError, TypeError, KeyError, AttributeError):

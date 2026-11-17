@@ -1,6 +1,6 @@
-# Reply Studio — private Instagram dashboard
+# Rviyan — private Instagram dashboard
 
-A React dashboard for one owner’s Instagram professional account. It turns top-level post comments into private DMs, then posts a public confirmation after Meta accepts the DM.
+A private React dashboard for one owner managing multiple Instagram professional accounts. It turns top-level post comments into private DMs, then posts a public confirmation after Meta accepts the DM.
 
 ## Run with Docker Desktop
 
@@ -56,6 +56,19 @@ Use the printed HTTPS hostname plus `/webhook` as Meta’s callback. Only `/webh
 docker compose --profile webhook stop webhook-tunnel
 ```
 
+## Website through Cloudflare Tunnel
+
+For a temporary public HTTPS dashboard, set `COOKIE_SECURE=true` in `.env`, then run:
+
+```sh
+docker compose --profile website up -d instagram-replies website-tunnel
+docker compose logs website-tunnel
+```
+
+Open the printed `https://…trycloudflare.com` URL and sign in with your dashboard password. Account data and settings stay protected by the app’s session authentication. The existing webhook tunnel remains independent and does not need a new Meta callback for this option.
+
+The app still runs on this computer. Keep Docker Desktop and the computer running. Quick Tunnel addresses change when their tunnel is recreated and are intended for testing; a named Cloudflare Tunnel with a domain provides a stable address. To stop website access, run `docker compose --profile website stop website-tunnel`.
+
 ## Cloud hosting
 
 Deploy the Dockerfile as one instance with a persistent disk mounted at `/data`. The container builds the React frontend and serves it with the Python API. Set `PORT` to the host’s HTTP port, `DATA_DIR=/data`, and `COOKIE_SECURE=true` behind HTTPS. Set credentials and the one-time setup code through the host’s secret settings. Expose port 8080 through HTTPS for the protected dashboard/API and `/webhook`; port 8081 is optional for webhook-only routing. Do not deploy multiple replicas with the SQLite/in-process queue design.
@@ -81,3 +94,28 @@ python3 -m unittest discover -s tests -v
 ```
 
 Stop the app with `docker compose down`. Data is retained; `docker compose down -v` deletes the data volume. Credentials, generated builds, screenshots, and runtime data must never be committed. `.env.example` contains only placeholders.
+
+### Multiple Instagram accounts under one login
+
+Use **Settings → Add an Instagram account**, enter its professional Instagram account ID and access token generated for the same Meta app, then connect. The server verifies identity and subscribes that account to comments before saving it. New accounts start paused. Select the account in the top bar, sync posts, configure its rules and post selection, and save to enable replies.
+
+Each account has separate settings, post cache, and activity. Signed webhook entries are routed by Instagram account ID; pending jobs use the originating account's credentials. Existing account settings, history, and owner login migrate automatically as account 1. Its credentials continue to come from `.env`. Additional tokens are stored only in the persistent SQLite database and are never returned by the API. Protect the Docker data volume and any backups; do not commit or publish them. This remains one owner's private dashboard, with no public registration or separate customer logins.
+
+Additional accounts must be authorized for the configured Meta app. Connecting them does not bypass Meta app roles, access permissions, token expiry, or App Review requirements. The dashboard requires HTTPS when entering credentials over a public tunnel.
+
+## Permanent Cloudflare Tunnel on a laptop
+
+Create a named, remotely managed Cloudflare Tunnel and run its Docker connector on the same Docker network as this Compose project. Set its restart policy to `unless-stopped`. In Cloudflare, publish two HTTP services:
+
+| Hostname | Origin service |
+| --- | --- |
+| `dashboard.yourdomain.com` | `http://instagram-replies:8080` |
+| `hooks.yourdomain.com` | `http://instagram-replies:8081` |
+
+Leave route paths blank. Set `COOKIE_SECURE=true` in the private `.env` and use the permanent `https://hooks.yourdomain.com/webhook` callback in Meta. Named tunnel hostnames remain stable across connector restarts. The laptop must stay awake, connected to the internet, with Docker and the tunnel connector running. Store the tunnel token privately; never commit its Docker command or token.
+
+If the connector was created separately, attach it to the app's network shown by Docker network inspection. Network membership and the restart policy persist for that container; recreating the connector requires configuring them again. The optional `webhook` and `website` Compose profiles are temporary Quick Tunnels and are not needed for named-tunnel access.
+
+## Branding
+
+The deployed Rviyan wordmark, RV monogram, and browser icon are editable SVG assets in `frontend/public/`. `branding/rviyan-logo-v2.png` is a newer logo concept for review; it is not yet applied to the dashboard.
