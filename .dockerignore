@@ -5,3 +5,6 @@ tests
 __pycache__
 *.jpg
 *.zip
+frontend/node_modules
+frontend/dist
+private-dashboard-link.html

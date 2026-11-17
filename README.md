@@ -1,53 +1,83 @@
-# Instagram Reply Studio
+# Reply Studio — private Instagram dashboard
 
-Local Docker prototype for **automatic comment-to-DM replies on Instagram**. No Python packages, AI API key, or Instagram credentials are needed for the simulator. Each new top-level comment triggers a private DM using a matching keyword template (or fallback), followed by a public “DM sent” comment reply. The public confirmation is sent only after Meta returns a message ID. Both texts are editable.
+A React dashboard for one owner’s Instagram professional account. It turns top-level post comments into private DMs, then posts a public confirmation after Meta accepts the DM.
 
-## Run locally
+## Run with Docker Desktop
 
 ```sh
 cp .env.example .env
+```
+
+Generate a random `DASHBOARD_SETUP_TOKEN` and enter it in your private `.env`:
+
+```sh
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 docker compose up --build -d
 ```
 
-Open http://localhost:8080. Save your reply rules, then simulate a comment. Its private DM and public reply appear automatically in Comment activity. Demo mode never posts to Instagram. Rules and the activity log survive restarts in the `reply-data` Docker volume.
+Open http://localhost:8080. On first use, enter the setup code and choose a password of at least 12 characters. The setup code works only before the owner account is created. Password hashes, sessions, settings, synced posts, and delivery records persist in the `reply-data` volume. Sessions expire after 12 hours. Five failed attempts block sign-in for 15 minutes.
+
+The default `MODE=demo` provides clearly labelled example posts and simulated messages. No Instagram credentials are needed for demo mode.
+
+## Dashboard
+
+- **Overview:** lifetime Instagram comment/reply counts, a recent seven-day activity chart, saved automation summary, and recent conversations. Simulations do not inflate live metrics.
+- **Automations:** ordered keyword rules, private DM templates, public comment text, unmatched-comment behavior, and pause control. Whole words or phrases match ignoring case; `hi` does not match `shipping`.
+- **Posts:** sync the latest 50 Instagram posts and select all or specific posts. Save changes to apply the scope.
+- **Activity:** latest 100 events with search, source/status filters, and separate DM/public reply results.
+- **Settings:** account connection, last sync, post count, signature configuration, pause control, and sign-out.
+- **Test automation:** simulate a comment against the saved rules and selected post. Simulations never contact Instagram, even in live mode.
+
+Only future webhook events trigger automation. Skipped comments are not replayed. Duplicate IDs are ignored. Replies and comments authored by your own account are excluded to prevent loops. Unconfirmed sends are not automatically retried; check Instagram before any manual action.
+
+## Connect Instagram
+
+Use a Business or Creator account and your Meta developer app. This app defaults to **Unified Login**, using `graph.facebook.com`. For an older Instagram Login app, set `GRAPH_API_HOST=graph.instagram.com`.
+
+1. Supply `INSTAGRAM_ACCOUNT_ID`, `INSTAGRAM_ACCESS_TOKEN`, `META_APP_SECRET`, and `WEBHOOK_VERIFY_TOKEN` through `.env` or your cloud host’s secrets. Your token must have access to the specific Instagram account and the comment/messaging permissions required by its login setup.
+2. Set `MODE=live` and recreate the container. Then sign into the dashboard and click **Sync Instagram** to verify account access and fetch recent posts.
+3. Give Meta a stable public HTTPS URL ending in `/webhook`, using the same verify token. Subscribe to `comments` in the app and subscribe the Instagram account to your app. App roles, testing restrictions, access levels, and review requirements depend on how the Meta app is used.
+4. Set your messages and selected posts in the dashboard, save, then test a comment from another account. Confirm both the DM (Inbox or Message Requests) and the public comment on Instagram.
+
+Meta permits a single private reply per comment within seven days. This tool does not send follow-up DMs. It sends the public “DM sent” confirmation only after Meta returns a private-message ID. Partial results preserve the confirmed DM if only the public reply fails.
+
+References: [Unified Login](https://developers.facebook.com/documentation/instagram-platform/instagram-api-with-unified-login), [private replies](https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login/messaging-api/private-replies), [webhooks](https://developers.facebook.com/docs/graph-api/webhooks/getting-started/webhooks-for-instagram/).
+
+## Temporary local webhook tunnel
 
 ```sh
-docker compose logs -f
-docker compose down
+docker compose --profile webhook up --build -d
+docker compose logs webhook-tunnel
 ```
 
-Stopping the app retains data; `docker compose down -v` deletes the data volume. The dashboard shows the latest 100 comments. All records remain in SQLite.
+Use the printed HTTPS hostname plus `/webhook` as Meta’s callback. Only `/webhook` is served on port 8081; dashboard/API routes return 404 there. The hostname changes when the tunnel is recreated. Keep Docker and the computer running during local tests.
 
-## Connect real Instagram comments
+```sh
+docker compose --profile webhook stop webhook-tunnel
+```
 
-The implementation defaults to **Instagram API with Unified Login** (`GRAPH_API_HOST=graph.facebook.com`). For an older Instagram Login app, set `GRAPH_API_HOST=graph.instagram.com`. Use a professional Business or Creator account and a Meta developer app with the Instagram product. Configure the login setup offered by your Meta app and obtain an access token with `instagram_business_basic`, `instagram_business_manage_comments`, and `instagram_business_manage_messages`. Account/app roles, app review, and access level requirements depend on which accounts the app serves.
+## Cloud hosting
 
-1. Configure `INSTAGRAM_ACCOUNT_ID`, `INSTAGRAM_ACCESS_TOKEN`, `META_APP_SECRET`, and a random `WEBHOOK_VERIFY_TOKEN` in `.env`. Set `MODE=live`. Never commit this file.
-2. Give Meta a public HTTPS callback ending in `/webhook`, for example using a local tunnel. **Only forward `/webhook`** through a reverse proxy; keep dashboard and `/api/*` private. This prototype dashboard has no user authentication.
-3. Set the same verify token in Meta, subscribe to the `comments` field, and subscribe the professional account to your app as instructed by Meta.
-4. Recreate the container: `docker compose up -d --force-recreate`.
-5. Add a real top-level comment to an owned post from another account. Confirm both the DM (Inbox or Message Requests) and the public comment reply in the dashboard and Instagram.
+Deploy the Dockerfile as one instance with a persistent disk mounted at `/data`. The container builds the React frontend and serves it with the Python API. Set `PORT` to the host’s HTTP port, `DATA_DIR=/data`, and `COOKIE_SECURE=true` behind HTTPS. Set credentials and the one-time setup code through the host’s secret settings. Expose port 8080 through HTTPS for the protected dashboard/API and `/webhook`; port 8081 is optional for webhook-only routing. Do not deploy multiple replicas with the SQLite/in-process queue design.
 
-Webhook events require a valid `X-Hub-Signature-256` signature and the configured account ID. Replies to comments and comments authored by the configured account are ignored to prevent reply loops. Duplicate comment IDs are ignored. Only future received events are processed; historical comments are not fetched.
+Back up `/data/replies.db` with the app stopped before moving hosts. Preserve your database to retain the owner login, rules, selected posts, and activity. Keep snapshots private. Larger deployments need a shared database, durable queue, token renewal, and scheduled rate-limit handling.
 
-Automatic DMs and public replies begin as soon as valid events arrive and automation is enabled. Pause and save automation before setup if you want to edit templates first. Paused comments are skipped, not replayed when resumed. Events with an uncertain send outcome are never automatically retried, to avoid duplicate public replies. Check Instagram before taking manual action.
+GitHub Actions repository secrets do not automatically populate local Docker or cloud host settings. A deployment workflow must explicitly map secrets to the chosen host; this project does not yet include that workflow.
 
-Meta permits one private reply per comment within seven days. A further conversation requires the recipient to respond; this prototype sends no follow-up DMs. If the DM cannot be confirmed, no public confirmation is attempted. If only the public reply fails, the confirmed DM is retained as a partial result.
+## Development and verification
 
-Official references: [private replies](https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login/messaging-api/private-replies), [comment moderation](https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login/comment-moderation), [webhooks](https://developers.facebook.com/docs/graph-api/webhooks/getting-started/webhooks-for-instagram/), [Meta API collection](https://www.postman.com/meta/instagram/documentation/6yqw8pt/instagram-api).
+The React app is in `frontend/`, using React and Vite with a committed lockfile. Node is required only for frontend development; the Docker build supplies it.
 
-## Move to cloud
+```sh
+cd frontend
+npm ci
+npm run build
+```
 
-Deploy the same Dockerfile on a container host with a persistent disk mounted at `/data`, and inject `.env` values through its secret manager. Run **one instance**: this prototype uses SQLite and an in-process worker. Back up `/data/replies.db` while the container is stopped before migration. Keep the dashboard behind authentication/private access and route only the webhook publicly over HTTPS.
-
-Before a broader production rollout, add dashboard authentication, token refresh/expiry handling, monitoring and rate-limit scheduling. For multiple instances, move records and jobs to a shared database and durable queue. This prototype has no AI generation, automatic historical import, or automatic retry of failed sends.
-
-## Tests
+The Python runtime uses only the standard library. Run backend and HTTP integration tests with Python 3.12:
 
 ```sh
 python3 -m unittest discover -s tests -v
 ```
 
-## Temporary local webhook tunnel
-
-Run `docker compose --profile webhook up --build -d` and use `docker compose logs webhook-tunnel` to find the HTTPS address. The tunnel forwards to port 8081, which serves only `/webhook`; the dashboard stays on localhost:8080. Configure Meta with the HTTPS address plus `/webhook`. The generated hostname changes when the tunnel is recreated. Stop it with `docker compose --profile webhook stop webhook-tunnel`. Demo mode accepts webhook verification but rejects comment event delivery; enable live mode only after validating the token, account access, and templates.
+Stop the app with `docker compose down`. Data is retained; `docker compose down -v` deletes the data volume. Credentials, generated builds, screenshots, and runtime data must never be committed. `.env.example` contains only placeholders.
